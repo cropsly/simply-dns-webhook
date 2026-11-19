@@ -49,7 +49,6 @@ type SimplyDNSProviderConfig struct {
 }
 
 type SimplyDnsSolver struct {
-	client     simplyComClient.SimplyClient
 	kubeClient *kubernetes.Clientset
 }
 
@@ -58,7 +57,7 @@ func (e *SimplyDnsSolver) Name() string {
 }
 func (e *SimplyDnsSolver) Present(ch *v1alpha1.ChallengeRequest) error {
 	log.Info("Presenting challenge for: ", ch.ResolvedFQDN)
-	err := loadCredentials(ch, e)
+	client, err := loadCredentials(ch, e)
 	if err != nil {
 		log.Errorf("load credentials failed(check secret configuration): %v", err)
 		return err
@@ -72,17 +71,17 @@ func (e *SimplyDnsSolver) Present(ch *v1alpha1.ChallengeRequest) error {
 	}
 	// PATCH TTL configuration (default 3600s, min 60s)
 	if cfg.TTLSeconds >= 60 {
-		e.client.DefaultTTL = cfg.TTLSeconds
-		log.Infof("Using custom TTL: %d seconds", e.client.DefaultTTL)
+		client.DefaultTTL = cfg.TTLSeconds
+		log.Infof("Using custom TTL: %d seconds", client.DefaultTTL)
 	} else if cfg.TTLSeconds > 0 {
 		log.Warnf("Ignoring invalid ttlSeconds=%d (must be >=60)", cfg.TTLSeconds)
 	}
 	// END PATCH
 
 
-	id, txtData, fetchErr := e.client.GetRecord(ch.ResolvedFQDN, ch.Key, "TXT")
+	id, txtData, fetchErr := client.GetRecord(ch.ResolvedFQDN, ch.Key, "TXT")
 	if fetchErr == nil && id != 0 && txtData != ch.Key {
-		_, err := e.client.UpdateRecord(id, ch.ResolvedFQDN, ch.Key, "TXT")
+		_, err := client.UpdateRecord(id, ch.ResolvedFQDN, ch.Key, "TXT")
 		if err != nil {
 			log.Errorf("presenting challenge failed: %v", err)
 			return err
@@ -93,7 +92,7 @@ func (e *SimplyDnsSolver) Present(ch *v1alpha1.ChallengeRequest) error {
 		log.Debug("Challenge have been created with record id: ", id)
 		return nil
 	} else {
-		id, err = e.client.AddRecord(ch.ResolvedFQDN, ch.Key, "TXT")
+		id, err = client.AddRecord(ch.ResolvedFQDN, ch.Key, "TXT")
 		if err != nil {
 			log.Errorf("presenting challenge failed: %v", err)
 			return err
@@ -106,18 +105,18 @@ func (e *SimplyDnsSolver) Present(ch *v1alpha1.ChallengeRequest) error {
 
 func (e *SimplyDnsSolver) CleanUp(ch *v1alpha1.ChallengeRequest) error {
 	log.Info("Cleaning up challenge for: ", ch.ResolvedFQDN)
-	err := loadCredentials(ch, e)
+	client, err := loadCredentials(ch, e)
 	if err != nil {
 		log.Errorf("load credentials failed(check secret configuration): %v", err)
 		return err
 	}
-	id, _, err := e.client.GetRecord(ch.ResolvedFQDN, ch.Key, "TXT")
+	id, _, err := client.GetRecord(ch.ResolvedFQDN, ch.Key, "TXT")
 	if err != nil {
 		log.Errorf("Record not present have been cleaned up: %v", err)
 		return nil
 	}
 	log.Info("Record(", id, ") fetched for cleanup.")
-	res := e.client.RemoveRecord(id, ch.ResolvedFQDN)
+	res := client.RemoveRecord(id, ch.ResolvedFQDN)
 	if res {
 		log.Debug("Record(", id, ") have been cleaned up.")
 		return nil
@@ -168,37 +167,32 @@ func stringFromSecretData(secretData *map[string][]byte, key string) (string, er
 	return string(data), nil
 }
 
-func loadCredentials(ch *v1alpha1.ChallengeRequest, e *SimplyDnsSolver) error {
-	if e.client.Credentials.ApiKey != "" {
-		return nil
-	}
-
+// Credentials are resolved per challenge, so each Issuer can use its own Simply account.
+func loadCredentials(ch *v1alpha1.ChallengeRequest, e *SimplyDnsSolver) (simplyComClient.SimplyClient, error) {
 	cfg, err := loadConfig(ch.Config)
 	if err != nil {
 		log.Errorf("error on loading config: %v", err)
-		return err
+		return simplyComClient.SimplyClient{}, err
 	}
 	if cfg.ApiKey != "" {
 		log.Debug("Loading API credentials from config.")
-		e.client = simplyComClient.CreateSimplyClient(cfg.AccountName, cfg.ApiKey)
-		return nil
+		return simplyComClient.CreateSimplyClient(cfg.AccountName, cfg.ApiKey), nil
 	} else {
 		secretName := cfg.SecretRef
 		log.Debug("Loading API credentials from secret: ", secretName)
 		sec, err := e.kubeClient.CoreV1().Secrets(ch.ResourceNamespace).Get(context.TODO(), secretName, metav1.GetOptions{})
 		if err != nil {
 			log.Errorf("error on loading secret from kubernetes api: %v", err)
-			return err
+			return simplyComClient.SimplyClient{}, err
 		}
 
 		accountName := string(sec.Data["account-name"])
 		apiKey, err := stringFromSecretData(&sec.Data, "api-key")
 		if err != nil {
 			log.Errorf("error on reading secret: %v", err)
-			return err
+			return simplyComClient.SimplyClient{}, err
 		}
 
-		e.client = simplyComClient.CreateSimplyClient(accountName, apiKey)
-		return nil
+		return simplyComClient.CreateSimplyClient(accountName, apiKey), nil
 	}
 }
